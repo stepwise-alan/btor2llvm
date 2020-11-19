@@ -2,7 +2,7 @@ import argparse
 import itertools
 import sys
 from abc import ABC
-from typing import Optional, List, TextIO, Union, Dict, ValuesView, Iterable
+from typing import Optional, List, TextIO, Union, Dict, Iterable
 
 from llvmlite import ir  # type: ignore
 
@@ -32,7 +32,7 @@ class BitvecSort(Sort):
         super().__init__(sid, symbol)
         self.width = width
 
-    def to_ir_type(self) -> ir.Type:
+    def to_ir_type(self) -> ir.IntType:
         return ir.IntType(self.width)
 
 
@@ -529,11 +529,10 @@ class Usubo(BitvecBinaryOp):
 
 class Concat(BitvecBinaryOp):
     def to_new_ir_value(self, builder: ir.IRBuilder, m: Dict[int, ir.Value]) -> ir.Value:
-        return builder.or_(
-            builder.shl(
-                builder.zext(self.bitvec1.to_ir_value(builder, m), self.sort.to_ir_type()),
-                ir.Constant(self.bitvec1.sort.to_ir_type(), self.bitvec2.sort.width)),
-            builder.zext(self.bitvec2.to_ir_value(builder, m), self.sort.to_ir_type()))
+        t: ir.IntType = self.sort.to_ir_type()
+        return builder.or_(builder.shl(builder.zext(self.bitvec1.to_ir_value(builder, m), t),
+                                       ir.Constant(t, self.bitvec2.sort.width)),
+                           builder.zext(self.bitvec2.to_ir_value(builder, m), t))
 
 
 class Read:
@@ -638,15 +637,15 @@ class ArrayInit(Node):
     nid: int
     sort: ArraySort
     state: ArrayState
-    array: Array
+    expr: Expr
 
-    def __init__(self, nid: int, sort: ArraySort, state: ArrayState, bitvec: Bitvec,
+    def __init__(self, nid: int, sort: ArraySort, state: ArrayState, expr: Expr,
                  symbol: str = ""):
         super().__init__(symbol)
         self.nid = nid
         self.sort = sort
         self.state = state
-        self.bitvec = bitvec
+        self.expr = expr
 
 
 class BitvecNext(Node):
@@ -670,13 +669,13 @@ class ArrayNext(Node):
     state: ArrayState
     array: Array
 
-    def __init__(self, nid: int, sort: ArraySort, state: ArrayState, bitvec: Bitvec,
+    def __init__(self, nid: int, sort: ArraySort, state: ArrayState, array: Array,
                  symbol: str = ""):
         super().__init__(symbol)
         self.nid = nid
         self.sort = sort
         self.state = state
-        self.bitvec = bitvec
+        self.array = array
 
 
 class Bad(Node):
@@ -729,6 +728,38 @@ class Justice(Node):
         self.nid = nid
         self.n = n
         self.expr_list = expr_list
+
+
+def ir_const_int(v: int, width: int):
+    return ir.Constant(ir.IntType(width), v)
+
+
+def gep(builder: ir.IRBuilder, p: ir.Value, i: int):
+    return builder.gep(p, (ir_const_int(0, 32), ir_const_int(i, 32)))
+
+
+def concat(builder: ir.IRBuilder, v1: ir.Value, v2: ir.Value, l1: int, l2: int):
+    t: ir.IntType = ir.IntType(l1 + l2)
+    return builder.or_(builder.shl(builder.zext(v1, t), ir.Constant(t, l2)), builder.zext(v2, t))
+
+
+def build_gen_function(bitvec_sorts: Iterable[BitvecSort], name: str, rand_function: ir.Function,
+                       struct_type: ir.BaseStructType) -> ir.Function:
+    function: ir.Function = ir.Function(
+        rand_function.module, ir.FunctionType(ir.VoidType(), (struct_type.as_pointer(),)), name)
+    builder: ir.IRBuilder = ir.IRBuilder(function.append_basic_block('entry'))
+
+    i: int
+    bitvec_sort: BitvecSort
+    for i, bitvec_sort in enumerate(bitvec_sorts):
+        v: ir.Value = builder.call(rand_function, ())
+        l1: int
+        for l1 in range(32, bitvec_sort.width, 32):
+            v = concat(builder, v, builder.call(rand_function, ()), l1, 32)
+        v = builder.trunc(v, ir.IntType(bitvec_sort.width))
+        builder.store(v, gep(builder, function.args[0], i))
+    builder.ret_void()
+    return function
 
 
 class Btor2Parser:
@@ -1051,101 +1082,197 @@ class Btor2Parser:
                 self.bitvec_table[nid] = Concat(nid, sort, self.get_bitvec(tokens[3]),
                                                 self.get_bitvec(tokens[4]))
 
-    def get_function_arg_types(self) -> Iterable[ir.Type]:
-        return (v.sort.to_ir_type() for v in itertools.chain(
-            self.bitvec_state_table.values(), self.bitvec_input_table.values()))
+    def build_module(self, name: str, n: int) -> ir.Module:
+        module: ir.Module = ir.Module(name, ir.Context())
+        rand_function: ir.Function = ir.Function(
+            module, ir.FunctionType(ir.IntType(32), ()), 'rand')
 
-    def get_function_type(self) -> ir.FunctionType:
-        states: ValuesView[BitvecState] = self.bitvec_state_table.values()
-        state_ir_types: List[ir.Type] = [v.sort.to_ir_type() for v in states]
-        ret_type: ir.LiteralStructType = ir.LiteralStructType(state_ir_types)
-        return ir.FunctionType(ret_type, self.get_function_arg_types())
+        bitvec_states: List[BitvecState] = list(self.bitvec_state_table.values())
+        state_sorts: List[BitvecSort] = [_.sort for _ in bitvec_states]
+        state_struct_type: ir.IdentifiedStructType = module.context.get_identified_type(
+            'struct.State')
+        state_struct_type.set_body(*(_.to_ir_type() for _ in state_sorts))
 
-    def build_init_function(self, module: ir.Module) -> ir.Function:
-        function_type: ir.FunctionType = self.get_function_type()
-        function: ir.Function = ir.Function(module, function_type, 'init')
-        builder: ir.IRBuilder = ir.IRBuilder(function.append_basic_block('entry'))
-        m: Dict[int, ir.Value] = dict(zip(itertools.chain(self.bitvec_state_table.keys(),
-                                                          self.bitvec_input_table.keys()),
-                                          function.args))
-        s: ir.Value = ir.Constant(function_type.return_type, ir.Undefined)
-        for i, state in enumerate(self.bitvec_state_table.values()):
-            s = builder.insert_value(s,
-                                     state.init.to_ir_value(builder, m) if state.init else
-                                     ir.Constant(state.sort.to_ir_type(), ir.Undefined), i)
-        builder.ret(s)
-        return function
+        bitvec_inputs: List[BitvecInput] = list(self.bitvec_input_table.values())
+        input_sorts: List[BitvecSort] = [_.sort for _ in bitvec_inputs]
+        input_struct_type: ir.IdentifiedStructType = module.context.get_identified_type(
+            'struct.Input')
+        input_struct_type.set_body(*(_.to_ir_type() for _ in input_sorts))
 
-    def build_next_function(self, module: ir.Module) -> ir.Function:
-        function_type: ir.FunctionType = self.get_function_type()
-        function: ir.Function = ir.Function(module, function_type, 'next')
-        builder: ir.IRBuilder = ir.IRBuilder(function.append_basic_block('entry'))
-        m: Dict[int, ir.Value] = dict(zip(itertools.chain(self.bitvec_state_table.keys(),
-                                                          self.bitvec_input_table.keys()),
-                                          function.args))
-        s: ir.Value = ir.Constant(function_type.return_type, ir.Undefined)
-        for i, state in enumerate(self.bitvec_state_table.values()):
-            s = builder.insert_value(s,
-                                     state.next.to_ir_value(builder, m) if state.next else
-                                     ir.Constant(state.sort.to_ir_type(), ir.Undefined), i)
-        builder.ret(s)
-        return function
+        no_init_bitvec_states: List[BitvecState] = [_ for _ in bitvec_states if not _.init]
+        no_init_state_sorts: List[BitvecSort] = [_.sort for _ in no_init_bitvec_states]
+        no_init_state_struct_type: ir.IdentifiedStructType = module.context.get_identified_type(
+            'struct.InitInput')
+        no_init_state_struct_type.set_body(*(_.to_ir_type() for _ in no_init_state_sorts))
 
-    def build_bad_function(self, module: ir.Module) -> ir.Function:
-        function: ir.Function = ir.Function(
-            module, ir.FunctionType(ir.IntType(1), self.get_function_arg_types()), 'bad')
-        builder: ir.IRBuilder = ir.IRBuilder(function.append_basic_block('entry'))
-        m: Dict[int, ir.Value] = dict(zip(itertools.chain(self.bitvec_state_table.keys(),
-                                                          self.bitvec_input_table.keys()),
-                                          function.args))
-        s: ir.Value = ir.Constant(ir.IntType(1), False)
+        no_next_bitvec_states: List[BitvecState] = [_ for _ in bitvec_states if not _.next]
+        no_next_state_sorts: List[BitvecSort] = [_.sort for _ in no_next_bitvec_states]
+        no_next_state_struct_type: ir.IdentifiedStructType = module.context.get_identified_type(
+            'struct.NextInput')
+        no_next_state_struct_type.set_body(*(_.to_ir_type() for _ in no_next_state_sorts))
+
+        gen_input_function: ir.Function = build_gen_function(
+            input_sorts, 'gen_input', rand_function, input_struct_type)
+        gen_init_input_function: ir.Function = build_gen_function(
+            no_init_state_sorts, 'gen_init_input', rand_function, no_init_state_struct_type)
+        gen_next_input_function: ir.Function = build_gen_function(
+            no_next_state_sorts, 'gen_next_input', rand_function, no_next_state_struct_type)
+
+        init_function: ir.Function = ir.Function(module, ir.FunctionType(ir.VoidType(), (
+            state_struct_type.as_pointer(), input_struct_type.as_pointer(),
+            no_init_state_struct_type.as_pointer())), 'init')
+        init_builder: ir.IRBuilder = ir.IRBuilder(init_function.append_basic_block('entry'))
+        init_m: Dict[int, ir.Value] = dict((_.nid, init_builder.load(
+            gep(init_builder, init_function.args[1], i))) for i, _ in enumerate(bitvec_inputs))
+
+        i: int
+        j: int = 0
+        bitvec_state: BitvecState
+        for i, bitvec_state in enumerate(bitvec_states):
+            v: ir.Value
+            if not bitvec_state.init:
+                v = init_builder.load(gep(init_builder, init_function.args[2], j))
+                j += 1
+            else:
+                v = bitvec_state.init.to_ir_value(init_builder, init_m)
+
+            init_builder.store(v, gep(init_builder, init_function.args[0], i))
+            init_m[bitvec_state.nid] = v
+
+        init_builder.ret_void()
+
+        next_function: ir.Function = ir.Function(module, ir.FunctionType(ir.VoidType(), (
+            state_struct_type.as_pointer(), input_struct_type.as_pointer(),
+            no_next_state_struct_type.as_pointer())), 'next')
+        next_builder: ir.IRBuilder = ir.IRBuilder(next_function.append_basic_block('entry'))
+        next_m: Dict[int, ir.Value] = dict(itertools.chain(
+            ((_.nid, next_builder.load(gep(next_builder, next_function.args[0], i)))
+             for i, _ in enumerate(bitvec_states)),
+            ((_.nid, next_builder.load(gep(next_builder, next_function.args[1], i)))
+             for i, _ in enumerate(bitvec_inputs))))
+
+        j = 0
+        vs: List[ir.Value] = []
+        for i, bitvec_state in enumerate(bitvec_states):
+            if not bitvec_state.next:
+                vs.append(next_builder.load(gep(next_builder, next_function.args[2], j)))
+                j += 1
+            else:
+                vs.append(bitvec_state.next.to_ir_value(next_builder, next_m))
+
+        for i, v in enumerate(vs):
+            next_builder.store(v, gep(next_builder, next_function.args[0], i))
+
+        next_builder.ret_void()
+
+        bad_function: ir.Function = ir.Function(module, ir.FunctionType(ir.IntType(1), (
+            state_struct_type.as_pointer(), input_struct_type.as_pointer())), 'bad')
+        bad_builder: ir.IRBuilder = ir.IRBuilder(bad_function.append_basic_block('entry'))
+        bad_m: Dict[int, ir.Value] = dict(itertools.chain(
+            ((_.nid, bad_builder.load(gep(bad_builder, bad_function.args[0], i)))
+             for i, _ in enumerate(bitvec_states)),
+            ((_.nid, bad_builder.load(gep(bad_builder, bad_function.args[1], i)))
+             for i, _ in enumerate(bitvec_inputs))))
+
+        bad_ret: ir.Value = ir.Constant(ir.IntType(1), False)
         for bad in self.bad_list:
-            s = builder.or_(s, bad.bitvec.to_ir_value(builder, m))
-        builder.ret(s)
-        return function
+            bad_ret = bad_builder.or_(bad_ret, bad.bitvec.to_ir_value(bad_builder, bad_m))
+        bad_builder.ret(bad_ret)
 
-    def build_constraint_function(self, module: ir.Module) -> ir.Function:
-        function: ir.Function = ir.Function(
-            module, ir.FunctionType(ir.IntType(1), self.get_function_arg_types()), 'constraint')
-        builder: ir.IRBuilder = ir.IRBuilder(function.append_basic_block('entry'))
-        m: Dict[int, ir.Value] = dict(zip(itertools.chain(self.bitvec_state_table.keys(),
-                                                          self.bitvec_input_table.keys()),
-                                          function.args))
-        s: ir.Value = ir.Constant(ir.IntType(1), True)
+        constraint_function: ir.Function = ir.Function(module, ir.FunctionType(ir.IntType(1), (
+            state_struct_type.as_pointer(), input_struct_type.as_pointer())), 'constraint')
+        constraint_builder: ir.IRBuilder = ir.IRBuilder(
+            constraint_function.append_basic_block('entry'))
+        constraint_m: Dict[int, ir.Value] = dict(itertools.chain(
+            ((_.nid, constraint_builder.load(gep(constraint_builder,
+                                                 constraint_function.args[0], i)))
+             for i, _ in enumerate(bitvec_states)),
+            ((_.nid, constraint_builder.load(gep(constraint_builder,
+                                                 constraint_function.args[1], i)))
+             for i, _ in enumerate(bitvec_inputs))))
+
+        constraint_ret: ir.Value = ir.Constant(ir.IntType(1), True)
         for constraint in self.constraint_list:
-            s = builder.and_(s, constraint.bitvec.to_ir_value(builder, m))
-        builder.ret(s)
-        return function
+            constraint_ret = constraint_builder.and_(
+                constraint_ret, constraint.bitvec.to_ir_value(constraint_builder, constraint_m))
+        constraint_builder.ret(constraint_ret)
 
-    def build_module(self) -> ir.Module:
-        module: ir.Module = ir.Module(__file__)
-        self.build_init_function(module)
-        self.build_next_function(module)
-        self.build_bad_function(module)
-        self.build_constraint_function(module)
+        main_function: ir.Function = ir.Function(module, ir.FunctionType(
+            ir.IntType(32), (ir.IntType(32), ir.IntType(8).as_pointer().as_pointer())), 'main')
+
+        entry_block: ir.Block = main_function.append_basic_block('entry')
+        for_body_block: ir.Block = main_function.append_basic_block('for.body')
+        else1_block: ir.Block = main_function.append_basic_block('else1')
+        else2_block: ir.Block = main_function.append_basic_block('else2')
+        for_end_block: ir.Block = main_function.append_basic_block('for.end')
+        else3_block: ir.Block = main_function.append_basic_block('else3')
+        ret0_block: ir.Block = main_function.append_basic_block('ret0')
+        ret1_block: ir.Block = main_function.append_basic_block('ret1')
+
+        entry_builder: ir.IRBuilder = ir.IRBuilder(entry_block)
+        state_ptr: ir.AllocaInstr = entry_builder.alloca(state_struct_type)
+        input_ptr: ir.AllocaInstr = entry_builder.alloca(input_struct_type)
+        init_input_ptr: ir.AllocaInstr = entry_builder.alloca(no_init_state_struct_type)
+        next_input_ptr: ir.AllocaInstr = entry_builder.alloca(no_next_state_struct_type)
+        entry_builder.call(gen_input_function, (input_ptr,))
+        entry_builder.call(gen_init_input_function, (init_input_ptr,))
+        entry_builder.call(init_function, (state_ptr, input_ptr, init_input_ptr))
+        entry_builder.branch(for_body_block)
+
+        for_body_builder: ir.IRBuilder = ir.IRBuilder(for_body_block)
+        i_phi: ir.PhiInstr = for_body_builder.phi(ir.IntType(32))
+        i_phi.add_incoming(ir_const_int(0, 32), entry_block)
+        for_body_builder.cbranch(for_body_builder.call(
+            constraint_function, (state_ptr, input_ptr)), else1_block, ret0_block)
+
+        else1_builder: ir.IRBuilder = ir.IRBuilder(else1_block)
+        else1_builder.cbranch(else1_builder.call(bad_function, (state_ptr, input_ptr)),
+                              ret1_block, else2_block)
+
+        else2_builder: ir.IRBuilder = ir.IRBuilder(else2_block)
+        else2_builder.call(gen_input_function, (input_ptr,))
+        else2_builder.call(gen_next_input_function, (next_input_ptr,))
+        else2_builder.call(next_function, (state_ptr, input_ptr, next_input_ptr))
+        inc: ir.Value = else2_builder.add(i_phi, ir_const_int(1, 32))
+        i_phi.add_incoming(inc, else2_block)
+        else2_builder.cbranch(else2_builder.icmp_signed('<', inc, ir_const_int(n, 32)),
+                              for_body_block, for_end_block)
+
+        for_end_builder: ir.IRBuilder = ir.IRBuilder(for_end_block)
+        for_end_builder.cbranch(for_end_builder.call(
+            constraint_function, (state_ptr, input_ptr)), else3_block, ret0_block)
+
+        else3_builder: ir.IRBuilder = ir.IRBuilder(else3_block)
+        else3_builder.cbranch(else3_builder.call(bad_function, (state_ptr, input_ptr)),
+                              ret1_block, ret0_block)
+
+        ret0_builder: ir.IRBuilder = ir.IRBuilder(ret0_block)
+        ret0_builder.ret(ir_const_int(0, 32))
+
+        ret1_builder: ir.IRBuilder = ir.IRBuilder(ret1_block)
+        ret1_builder.ret(ir_const_int(1, 32))
         return module
 
 
-def main() -> None:
+def main() -> int:
     argument_parser: argparse.ArgumentParser = argparse.ArgumentParser(
         description='A tool to convert btor2 files to LLVM.')
-    argument_parser.add_argument('input', metavar='FILE', help='input btor2 file', nargs='?',
-                                 type=argparse.FileType('r'), default=sys.stdin)
-    argument_parser.add_argument('-output', '--output', metavar='FILE',
-                                 help='place the output into [FILE]',
-                                 nargs='?', type=argparse.FileType('w+'), default=sys.stdout)
+    argument_parser.add_argument('input', metavar='FILE', help='input btor2 file')
+    argument_parser.add_argument('-output', '--output', help='place the output into [FILE]',
+                                 metavar='FILE', nargs='?', default='out.ll')
+    argument_parser.add_argument('-n', '--n', help='set the number of iterations',
+                                 metavar='N', nargs='?', type=int, default=10)
 
     namespace: argparse.Namespace = argument_parser.parse_args()
 
     parser: Btor2Parser = Btor2Parser()
-    parser.parse(namespace.input)
-    namespace.output.write(str(parser.build_module()))
+    with open(namespace.input) as input_file:
+        parser.parse(input_file)
+    with open(namespace.output, 'w+') as output_file:
+        output_file.write(str(parser.build_module(namespace.input, namespace.n)))
 
-    if namespace.input != sys.stdin:
-        namespace.input.close()
-    if namespace.output != sys.stdout:
-        namespace.output.close()
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())
