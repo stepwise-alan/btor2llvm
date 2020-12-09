@@ -59,6 +59,14 @@ class FuzzerInputGenerator(InputGenerator):
         n: int = int((width + 7) / 8)
         self.total_used += n
 
+        # r: ir.Value = self.builder.zext(self.builder.load(
+        #     self.builder.gep(self.data, (self.used,))), ir.IntType(width))
+        # self.used = self.builder.add(self.used, ir_const_int(1, 64))
+        # for i in range(1, n):
+        #     r = self.builder.or_(r, self.builder.shl(self.builder.zext(self.builder.load(
+        #         self.builder.gep(self.data, (self.used,))), ir.IntType(width)),
+        #         ir.Constant(ir.IntType(width), i * 8)))
+        #     self.used = self.builder.add(self.used, ir_const_int(1, 64))
         r: ir.Value = self.builder.trunc(self.builder.load(self.builder.bitcast(
             self.builder.gep(self.data, (self.used,)), ir.IntType(n * 8).as_pointer())),
             ir.IntType(width))
@@ -895,10 +903,91 @@ def build_reduce_function(module: ir.Module, name: str, bitvec_states: Iterable[
         return function
 
 
+def ir_c_str(builder: ir.IRBuilder, name: str, s: str) -> ir.Value:
+    c: ir.Constant = ir.Constant(ir.ArrayType(ir.IntType(8), len(s)), bytearray(s.encode('utf8')))
+    g: ir.GlobalVariable = ir.GlobalVariable(builder.module, c.type, name)
+    g.linkage = 'internal'
+    g.global_constant = True
+    g.initializer = c
+    return builder.bitcast(g, ir.IntType(8).as_pointer())
+
+
+def build_print_state_function(module: ir.Module, bitvec_states: Iterable[BitvecState],
+                               state_struct_type: ir.BaseStructType,
+                               printf_function: ir.Function) -> ir.Function:
+    function: ir.Function = ir.Function(module, ir.FunctionType(
+        ir.VoidType(), (state_struct_type.as_pointer(),)), 'print_state')
+    builder: ir.IRBuilder = ir.IRBuilder(function.append_basic_block('entry'))
+
+    afs: ir.Value = ir_c_str(builder, "print_state_fs", "%x\0")
+    ans: ir.Value = ir_c_str(builder, "print_state_ns", "\n\0")
+
+    i: int
+    bitvec_state: BitvecState
+    for i, bitvec_state in enumerate(bitvec_states):
+        w: int = bitvec_state.sort.width
+
+        builder.call(printf_function, (ir_c_str(builder, "print_state_{}".format(
+            bitvec_state.nid), "nid: {}, width: {}, value: \0".format(bitvec_state.nid, w)),))
+
+        v: ir.Value = builder.load(builder.gep(function.args[0], (ir.Constant(ir.IntType(32), 0),
+                                                                  ir.Constant(ir.IntType(32), i))))
+
+        for j in range(int((w - 1) / 32) * 32, -1, -32):
+            sv: ir.Value = builder.shl(v, ir.Constant(ir.IntType(w), j))
+            if w < 32:
+                sv = builder.zext(sv, ir.IntType(32))
+            elif w > 32:
+                sv = builder.trunc(sv, ir.IntType(32))
+            builder.call(printf_function, (afs, sv))
+
+        builder.call(printf_function, (ans,))
+
+    builder.ret_void()
+    return function
+
+
+def build_print_input_function(module: ir.Module, bitvec_inputs: Iterable[BitvecInput],
+                               input_struct_type: ir.BaseStructType,
+                               printf_function: ir.Function) -> ir.Function:
+    function: ir.Function = ir.Function(module, ir.FunctionType(
+        ir.VoidType(), (input_struct_type.as_pointer(),)), 'print_input')
+    builder: ir.IRBuilder = ir.IRBuilder(function.append_basic_block('entry'))
+
+    afs: ir.Value = ir_c_str(builder, "print_input_fs", "%x\0")
+    ans: ir.Value = ir_c_str(builder, "print_input_ns", "\n\0")
+
+    i: int
+    bitvec_input: BitvecInput
+    for i, bitvec_input in enumerate(bitvec_inputs):
+        w: int = bitvec_input.sort.width
+
+        builder.call(printf_function, (ir_c_str(builder, "print_input_{}".format(
+            bitvec_input.nid), "nid: {}, width: {}, value: \0".format(bitvec_input.nid, w)),))
+
+        v: ir.Value = builder.load(builder.gep(function.args[0], (ir.Constant(ir.IntType(32), 0),
+                                                                  ir.Constant(ir.IntType(32), i))))
+
+        for j in range(int((w - 1) / 32) * 32, -1, -32):
+            sv: ir.Value = builder.shl(v, ir.Constant(ir.IntType(w), j))
+            if w < 32:
+                sv = builder.zext(sv, ir.IntType(32))
+            elif w > 32:
+                sv = builder.trunc(sv, ir.IntType(32))
+            builder.call(printf_function, (afs, sv))
+
+        builder.call(printf_function, (ans,))
+
+    builder.ret_void()
+    return function
+
+
 def build_main_function(module: ir.Module, state_struct_type: ir.BaseStructType,
                         input_struct_type: ir.BaseStructType,
                         init_function: ir.Function, next_function: ir.Function,
                         constraint_function: ir.Function, bad_function: ir.Function,
+                        printf_function: ir.Function, print_state_function: ir.Function,
+                        print_input_function: ir.Function,
                         init_tu: int, next_tu: int, n: int) -> ir.Function:
     function: ir.Function = ir.Function(module, ir.FunctionType(ir.IntType(32), ()), 'main')
 
@@ -961,32 +1050,13 @@ def build_test_function(module: ir.Module, state_struct_type: ir.BaseStructType,
                         input_struct_type: ir.BaseStructType,
                         init_function: ir.Function, next_function: ir.Function,
                         constraint_function: ir.Function, bad_function: ir.Function,
+                        printf_function: ir.Function, print_state_function: ir.Function,
+                        print_input_function: ir.Function,
                         init_tu: int, next_tu: int, n: int) -> ir.Function:
     function: ir.Function = ir.Function(module, ir.FunctionType(
         ir.IntType(32), (ir.IntType(8).as_pointer(), ir.IntType(64))), 'LLVMFuzzerTestOneInput')
     data: ir.Argument = function.args[0]
     size: ir.Argument = function.args[1]
-
-    ########################################
-    # printf_function_type = ir.FunctionType(ir.IntType(32), [
-    #     ir.PointerType(ir.IntType(8))], var_arg=True)
-    # printf_function = ir.Function(module, printf_function_type, name="printf")
-    #
-    # fmt = "%x\n\0"
-    # c_fmt = ir.Constant(ir.ArrayType(ir.IntType(8), len(fmt)), bytearray(fmt.encode("utf8")))
-    # global_fmt = ir.GlobalVariable(module, c_fmt.type, name="fstr")
-    # global_fmt.linkage = 'internal'
-    # global_fmt.global_constant = True
-    # global_fmt.initializer = c_fmt
-    #
-    # fmt_begin = "begin\n\0"
-    # c_fmt_begin = ir.Constant(ir.ArrayType(ir.IntType(8), len(fmt_begin)),
-    #                           bytearray(fmt_begin.encode("utf8")))
-    # global_fmt_begin = ir.GlobalVariable(module, c_fmt_begin.type, name="begin_str")
-    # global_fmt_begin.linkage = 'internal'
-    # global_fmt_begin.global_constant = True
-    # global_fmt_begin.initializer = c_fmt_begin
-    ########################################
 
     entry_block: ir.Block = function.append_basic_block('entry')
     init_block: ir.Block = function.append_basic_block('init')
@@ -998,16 +1068,6 @@ def build_test_function(module: ir.Module, state_struct_type: ir.BaseStructType,
     err_block: ir.Block = function.append_basic_block('error')
 
     entry_builder: ir.IRBuilder = ir.IRBuilder(entry_block)
-    ########################################
-    # fmt_arg = entry_builder.bitcast(global_fmt, ir.IntType(8).as_pointer())
-    # fmt_begin_arg = entry_builder.bitcast(global_fmt_begin, ir.IntType(8).as_pointer())
-    # entry_builder.call(printf_function, (fmt_begin_arg, size))
-    # entry_builder.call(printf_function, (fmt_arg, size))
-    # entry_builder.call(printf_function, (fmt_arg, entry_builder.load(
-    #     entry_builder.gep(data, (ir.Constant(ir.IntType(32), 0),)))))
-    # entry_builder.call(printf_function, (fmt_arg, entry_builder.load(
-    #     entry_builder.gep(data, (ir.Constant(ir.IntType(32), 1),)))))
-    ########################################
     entry_builder.cbranch(
         entry_builder.icmp_unsigned('<', size, ir.Constant(ir.IntType(64), init_tu)),
         ret_block, init_block)
@@ -1016,28 +1076,25 @@ def build_test_function(module: ir.Module, state_struct_type: ir.BaseStructType,
     state_ptr: ir.AllocaInstr = init_builder.alloca(state_struct_type)
     input_ptr: ir.AllocaInstr = init_builder.alloca(input_struct_type)
     init_builder.call(init_function, (state_ptr, input_ptr, data, ir_const_int(0, 64)))
-    ########################################
-    # init_builder.call(printf_function, (
-    #     fmt_arg, init_builder.load(gep(init_builder, state_ptr, 0)),))
-    # init_builder.call(printf_function, (
-    #     fmt_arg, init_builder.load(gep(init_builder, state_ptr, 1)),))
-    ########################################
+
+    s_cs: ir.Value = ir_c_str(init_builder, "test_ss", "State %d\n\0")
+    init_builder.call(printf_function, (s_cs, ir.Constant(ir.IntType(32), 0)))
+    init_builder.call(print_state_function, (state_ptr,))
+    i_cs: ir.Value = ir_c_str(init_builder, "test_is", "Input %d\n\0")
+    init_builder.call(printf_function, (i_cs, ir.Constant(ir.IntType(32), 0)))
+    init_builder.call(print_input_function, (input_ptr,))
     init_builder.branch(for_body_block)
 
     for_body_builder: ir.IRBuilder = ir.IRBuilder(for_body_block)
     u_phi: ir.PhiInstr = for_body_builder.phi(ir.IntType(64))
     u_phi.add_incoming(ir_const_int(init_tu, 64), init_block)
+    i_phi: ir.PhiInstr = for_body_builder.phi(ir.IntType(32))
+    i_phi.add_incoming(ir_const_int(0, 32), init_block)
 
     for_body_builder.cbranch(for_body_builder.call(
         constraint_function, (state_ptr, input_ptr)), ct_block, ret_block)
 
     ct1_builder: ir.IRBuilder = ir.IRBuilder(ct_block)
-    ########################################
-    # bad_builder.call(printf_function, (
-    #     fmt_arg, bad_builder.load(gep(bad_builder, state_ptr, 0)),))
-    # bad_builder.call(printf_function, (
-    #     fmt_arg, bad_builder.load(gep(bad_builder, state_ptr, 1)),))
-    ########################################
     ct1_builder.cbranch(ct1_builder.call(bad_function, (state_ptr, input_ptr)), err_block, bf_block)
 
     bf_builder: ir.IRBuilder = ir.IRBuilder(bf_block)
@@ -1045,20 +1102,14 @@ def build_test_function(module: ir.Module, state_struct_type: ir.BaseStructType,
     bf_builder.cbranch(bf_builder.icmp_unsigned('<', size, new_u), ret_block, next_block)
 
     next_builder: ir.IRBuilder = ir.IRBuilder(next_block)
-    ########################################
-    # next_builder.call(printf_function, (
-    #     fmt_arg, next_builder.load(gep(next_builder, state_ptr, 0)),))
-    # next_builder.call(printf_function, (
-    #     fmt_arg, next_builder.load(gep(next_builder, state_ptr, 1)),))
-    ########################################
     next_builder.call(next_function, (state_ptr, input_ptr, data, u_phi))
-    ########################################
-    # next_builder.call(printf_function, (
-    #     fmt_arg, next_builder.load(gep(next_builder, state_ptr, 0)),))
-    # next_builder.call(printf_function, (
-    #     fmt_arg, next_builder.load(gep(next_builder, state_ptr, 1)),))
-    ########################################
+    new_i: ir.Value = next_builder.add(i_phi, ir_const_int(1, 32))
+    next_builder.call(printf_function, (s_cs, new_i))
+    next_builder.call(print_state_function, (state_ptr,))
+    next_builder.call(printf_function, (i_cs, new_i))
+    next_builder.call(print_input_function, (input_ptr,))
     u_phi.add_incoming(new_u, next_block)
+    i_phi.add_incoming(new_i, next_block)
     next_builder.branch(for_body_block)
 
     ret_builder: ir.IRBuilder = ir.IRBuilder(ret_block)
@@ -1397,7 +1448,8 @@ class Btor2Parser:
                         generator_maker: Callable[[ir.IRBuilder], InputGenerator],
                         entry_function_builder: Callable[
                             [ir.Module, ir.BaseStructType, ir.BaseStructType, ir.Function,
-                             ir.Function, ir.Function, ir.Function, int, int, int], ir.Function]
+                             ir.Function, ir.Function, ir.Function, ir.Function, ir.Function,
+                             ir.Function, int, int, int], ir.Function]
                         ) -> None:
         bitvec_states: List[BitvecState] = list(self.bitvec_state_table.values())
         bitvec_inputs: List[BitvecInput] = list(self.bitvec_input_table.values())
@@ -1429,9 +1481,16 @@ class Btor2Parser:
             input_struct_type, ir.IRBuilder.and_,
             [constraint.bitvec for constraint in self.constraint_list], True)
 
+        printf_function = ir.Function(module, ir.FunctionType(
+            ir.IntType(32), [ir.PointerType(ir.IntType(8))], var_arg=True), "printf")
+        print_state_function = build_print_state_function(module, bitvec_states, state_struct_type,
+                                                          printf_function)
+        print_input_function = build_print_input_function(module, bitvec_inputs, input_struct_type,
+                                                          printf_function)
+
         entry_function_builder(module, state_struct_type, input_struct_type, init_function,
-                               next_function, constraint_function, bad_function, init_tu, next_tu,
-                               n)
+                               next_function, constraint_function, bad_function, printf_function,
+                               print_state_function, print_input_function, init_tu, next_tu, n)
 
     def build_module_with_main(self, name: str, n: int, triple: str, data_layout: str) -> ir.Module:
         module: ir.Module = ir.Module(name, ir.Context())
