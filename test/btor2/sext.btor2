@@ -1,0 +1,28 @@
+1 sort bitvec 1
+2 sort bitvec 5
+3 sort bitvec 10
+4 zero 2                ; 0
+5 ones 2                ; -1
+6 const 2 10000         ; -16
+7 const 2 00110         ; 6
+8 const 2 11010         ; -6
+9 zero 3                ; 0
+10 ones 3               ; -1
+11 const 3 1111110000   ; -16
+12 const 3 0000000110   ; 6
+13 const 3 1111111010   ; -6
+14 sext 3 4 5
+15 sext 3 5 5
+16 sext 3 6 5
+17 sext 3 7 5
+18 sext 3 8 5
+19 eq 1 9 14
+20 eq 1 10 15
+21 eq 1 11 16
+22 eq 1 12 17
+23 eq 1 13 18
+24 and 1 19 20
+25 and 1 24 21
+26 and 1 25 22
+27 and 1 26 23
+28 bad -27

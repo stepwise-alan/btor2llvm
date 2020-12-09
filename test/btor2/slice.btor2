@@ -1,0 +1,20 @@
+1 sort bitvec 1
+2 sort bitvec 5
+3 sort bitvec 10
+4 const 3 1101000101
+5 const 2 11010
+6 const 2 10100
+7 const 2 10001
+8 const 2 00101
+9 slice 2 4 9 5
+10 slice 2 4 8 4
+11 slice 2 4 6 2
+12 slice 2 4 4 0
+13 neq 1 5 9
+14 neq 1 6 10
+15 neq 1 7 11
+16 neq 1 8 12
+17 or 1 13 14
+18 or 1 17 15
+19 or 1 18 16
+20 bad 19

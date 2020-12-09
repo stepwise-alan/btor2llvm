@@ -1,0 +1,27 @@
+1 sort bitvec 1
+2 sort bitvec 5
+3 zero 2
+4 ones 2
+5 const 2 10000
+6 const 2 00110
+7 const 2 11010
+8 ones 2
+9 zero 2
+10 const 2 01111
+11 const 2 11001
+12 const 2 00101
+13 not 2 3
+14 not 2 4
+15 not 2 5
+16 not 2 6
+17 not 2 7
+18 neq 1 8 13
+19 neq 1 9 14
+20 neq 1 10 15
+21 neq 1 11 16
+22 neq 1 12 17
+23 or 1 18 19
+24 or 1 23 20
+25 or 1 24 21
+26 or 1 25 22
+27 bad 26
