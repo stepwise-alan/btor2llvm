@@ -4,7 +4,7 @@ import subprocess
 import pandas
 
 if __name__ == '__main__':
-    timeout: int = 5
+    timeout: int = 60
     btor_dir: str = '../opt/hwmcc20'
     in_dir: str = '../data/hwmcc20'
     out_dir: str = '../out/hwmcc20'
