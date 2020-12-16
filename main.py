@@ -74,7 +74,7 @@ class FuzzerInputGenerator(InputGenerator):
         return r
 
 
-global_strings: Dict[str, ir.GlobalVariable] = dict()
+global_strings: Dict[str, ir.GlobalVariable]
 
 
 def get_global_string(module: ir.Module, s: str) -> ir.GlobalVariable:
@@ -1114,6 +1114,7 @@ def build_test_function(module: ir.Module, state_struct_type: ir.BaseStructType,
     err_block: ir.Block = function.append_basic_block('error')
 
     entry_builder: ir.IRBuilder = ir.IRBuilder(entry_block)
+    entry_builder.call(printf_function, (get_string(entry_builder, '\nBegin\n'),))
     entry_builder.cbranch(
         entry_builder.icmp_unsigned('<', size, ir.Constant(ir.IntType(64), init_tu)),
         ret_block, init_block)
@@ -1561,6 +1562,11 @@ class Btor2Parser:
         module: ir.Module = ir.Module(name, ir.Context())
         module.triple = triple
         module.data_layout = data_layout
+
+        global global_strings
+        global_strings = dict()
+        global string_local_envs
+        string_local_envs = dict()
 
         def make_generator(builder: ir.IRBuilder) -> InputGenerator:
             return FuzzerInputGenerator(builder, builder.function.args[2], builder.function.args[3])
