@@ -27,7 +27,7 @@ if __name__ == '__main__':
             exit(1)
 
         p = subprocess.run(['./a.out', '-max_total_time={}'.format(timeout)], cwd=out_path,
-                           capture_output=True)
+                           stdout=subprocess.DEVNULL)
         if p.returncode == 77:
             result: pandas.Series = hwmcc20_results.query(
                 "index == '{}'".format(test_name))['result']
