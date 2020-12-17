@@ -901,7 +901,7 @@ def build_init_function(module: ir.Module, bitvec_states: List[BitvecState],
         if isinstance(v.type, ir.IntType):
             w: int = v.type.width
             builder.call(printf_function,
-                         (get_string(builder, "{} ({}):".format(nid, w)),))
+                         (get_string(builder, "{} ({}): ".format(nid, w)),))
             print_integer(builder, v, w, printf_function)
             print_newline(builder, printf_function)
 
@@ -961,7 +961,8 @@ def build_reduce_function(module: ir.Module, name: str, bitvec_states: Iterable[
                           state_struct_type: ir.BaseStructType,
                           input_struct_type: ir.BaseStructType,
                           reduce_function: Callable[[ir.IRBuilder, ir.Value, ir.Value], ir.Value],
-                          bool_bitvecs: List[Bitvec], default: bool) -> ir.Function:
+                          bool_bitvecs: List[Bitvec], default: bool,
+                          printf_function: ir.Function) -> ir.Function:
     function: ir.Function = ir.Function(module, ir.FunctionType(
         ir.IntType(1), (state_struct_type.as_pointer(), input_struct_type.as_pointer())), name)
     builder: ir.IRBuilder = ir.IRBuilder(function.append_basic_block('entry'))
@@ -975,8 +976,19 @@ def build_reduce_function(module: ir.Module, name: str, bitvec_states: Iterable[
                 ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), i)))))
             for i, bitvec_input in enumerate(bitvec_inputs))))
 
-        builder.ret(functools.reduce(lambda v1, v2: reduce_function(builder, v1, v2), (
-            bitvec.to_ir_value(builder, m) for bitvec in bool_bitvecs)))
+        ret: ir.Value = functools.reduce(lambda v1, v2: reduce_function(builder, v1, v2), (
+            bitvec.to_ir_value(builder, m) for bitvec in bool_bitvecs))
+
+        builder.call(printf_function, (get_string(builder, name + "\n"),))
+        for nid, v in sorted(m.items()):
+            if isinstance(v.type, ir.IntType):
+                w: int = v.type.width
+                builder.call(printf_function,
+                             (get_string(builder, "{} ({}): ".format(nid, w)),))
+                print_integer(builder, v, w, printf_function)
+                print_newline(builder, printf_function)
+
+        builder.ret(ret)
         return function
     else:
         builder.ret(ir.Constant(ir.IntType(1), default))
@@ -1528,12 +1540,14 @@ class Btor2Parser:
 
         bad_function: ir.Function = build_reduce_function(
             module, 'bad', bitvec_states, bitvec_inputs, state_struct_type,
-            input_struct_type, ir.IRBuilder.or_, [bad.bitvec for bad in self.bad_list], False)
+            input_struct_type, ir.IRBuilder.or_, [bad.bitvec for bad in self.bad_list], False,
+            printf_function)
 
         constraint_function: ir.Function = build_reduce_function(
             module, 'constraint', bitvec_states, bitvec_inputs, state_struct_type,
             input_struct_type, ir.IRBuilder.and_,
-            [constraint.bitvec for constraint in self.constraint_list], True)
+            [constraint.bitvec for constraint in self.constraint_list], True,
+            printf_function)
 
         print_state_function = build_print_state_function(module, bitvec_states, state_struct_type,
                                                           printf_function)
