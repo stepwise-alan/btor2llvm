@@ -90,7 +90,7 @@ def get_global_string(module: ir.Module, s: str) -> ir.GlobalVariable:
     return g
 
 
-string_local_envs: Dict[ir.Function, Dict[str, ir.Value]] = dict()
+string_local_envs: Dict[ir.Function, Dict[str, ir.Value]] = {}
 
 
 def get_string(builder: ir.IRBuilder, s: str) -> ir.Value:
@@ -100,7 +100,7 @@ def get_string(builder: ir.IRBuilder, s: str) -> ir.Value:
         if s in string_local_env:
             return string_local_env[s]
     else:
-        string_local_env = dict()
+        string_local_env = {}
         string_local_envs[builder.function] = string_local_env
 
     v: ir.Value = builder.bitcast(get_global_string(builder.module, s), ir.IntType(8).as_pointer())
@@ -130,10 +130,18 @@ def print_integer(builder: ir.IRBuilder, v: ir.Value, w: int, printf_function: i
                 fmt = get_string(builder, '%08x')
 
             builder.call(printf_function, (fmt, sv))
+    builder.call(printf_function, (get_string(builder, ' ({})'.format(w)),))
 
 
 def print_newline(builder: ir.IRBuilder, printf_function: ir.Function) -> None:
     builder.call(printf_function, (get_string(builder, '\n'),))
+
+
+node_map: Dict[int, str] = {}
+next_map: Dict[int, str] = {}
+init_map: Dict[int, str] = {}
+bad_line: str = ''
+constraint_line: str = ''
 
 
 class Node(ABC):
@@ -876,11 +884,16 @@ def build_init_function(module: ir.Module, bitvec_states: List[BitvecState],
     m: Dict[int, ir.Value] = {}
     generator: InputGenerator = generator_maker(builder)
 
+    builder.call(printf_function, (get_string(builder, "; init\n"),))
+
+    new_vs: Dict[int, ir.Value] = {}
+
     i: int
     v: ir.Value
     bitvec_input: BitvecInput
     for i, bitvec_input in enumerate(bitvec_inputs):
         v = generator.generate_input(bitvec_input.sort.width)
+        new_vs[bitvec_input.nid] = v
         builder.store(v, builder.gep(function.args[1], (ir.Constant(ir.IntType(32), 0),
                                                         ir.Constant(ir.IntType(32), i))))
         m[bitvec_input.nid] = v
@@ -892,17 +905,25 @@ def build_init_function(module: ir.Module, bitvec_states: List[BitvecState],
         else:
             v = bitvec_state.init.to_ir_value(builder, m)
 
+        new_vs[bitvec_state.nid] = v
         builder.store(v, builder.gep(function.args[0], (ir.Constant(ir.IntType(32), 0),
                                                         ir.Constant(ir.IntType(32), i))))
         m[bitvec_state.nid] = v
 
-    builder.call(printf_function, (get_string(builder, "Init\n"),))
     for nid, v in sorted(m.items()):
         if isinstance(v.type, ir.IntType):
             w: int = v.type.width
-            builder.call(printf_function,
-                         (get_string(builder, "{} ({}): ".format(nid, w)),))
+            builder.call(printf_function, (get_string(builder, "{}; ".format(
+                node_map[nid])),))
             print_integer(builder, v, w, printf_function)
+            print_newline(builder, printf_function)
+
+    for nid, v in sorted(new_vs.items()):
+        if isinstance(v.type, ir.IntType):
+            builder.call(printf_function, (get_string(
+                builder, "{}; {} = ".format(
+                    init_map[nid] if nid in init_map else node_map[nid], nid)),))
+            print_integer(builder, v, v.type.width, printf_function)
             print_newline(builder, printf_function)
 
     builder.ret_void()
@@ -926,30 +947,44 @@ def build_next_function(module: ir.Module, bitvec_states: Iterable[BitvecState],
                                       (builder.load(p) for p in ps)))
     generator: InputGenerator = generator_maker(builder)
 
+    builder.call(printf_function, (get_string(builder, "; next\n"),))
+
+    new_vs: Dict[int, ir.Value] = {}
+
     i: int
     v: ir.Value
     bitvec_input: BitvecInput
     for i, bitvec_input in enumerate(bitvec_inputs):
         v = generator.generate_input(bitvec_input.sort.width)
+        new_vs[bitvec_input.nid] = v
         builder.store(v, builder.gep(function.args[1], (ir.Constant(ir.IntType(32), 0),
                                                         ir.Constant(ir.IntType(32), i))))
         m[bitvec_input.nid] = v
 
-    bitvec_State: BitvecState
+    bitvec_state: BitvecState
     p: ir.Value
     for bitvec_state, p in zip(bitvec_states, ps):
         if not bitvec_state.next:
-            builder.store(generator.generate_input(bitvec_state.sort.width), p)
+            v = generator.generate_input(bitvec_state.sort.width)
         else:
-            builder.store(bitvec_state.next.to_ir_value(builder, m), p)
+            v = bitvec_state.next.to_ir_value(builder, m)
 
-    builder.call(printf_function, (get_string(builder, "Next\n"),))
+        new_vs[bitvec_state.nid] = v
+        builder.store(v, p)
+
     for nid, v in sorted(m.items()):
         if isinstance(v.type, ir.IntType):
-            w: int = v.type.width
-            builder.call(printf_function,
-                         (get_string(builder, "{} ({}): ".format(nid, w)),))
-            print_integer(builder, v, w, printf_function)
+            builder.call(printf_function, (get_string(builder, "{}; ".format(
+                node_map[nid])),))
+            print_integer(builder, v, v.type.width, printf_function)
+            print_newline(builder, printf_function)
+
+    for nid, v in sorted(new_vs.items()):
+        if isinstance(v.type, ir.IntType):
+            builder.call(printf_function, (get_string(
+                builder, "{}; {} = ".format(
+                    next_map[nid] if nid in next_map else node_map[nid], nid)),))
+            print_integer(builder, v, v.type.width, printf_function)
             print_newline(builder, printf_function)
 
     builder.ret_void()
@@ -979,15 +1014,23 @@ def build_reduce_function(module: ir.Module, name: str, bitvec_states: Iterable[
         ret: ir.Value = functools.reduce(lambda v1, v2: reduce_function(builder, v1, v2), (
             bitvec.to_ir_value(builder, m) for bitvec in bool_bitvecs))
 
-        builder.call(printf_function, (get_string(builder, name + "\n"),))
+        builder.call(printf_function, (get_string(builder, '; {}\n'.format(name)),))
         for nid, v in sorted(m.items()):
             if isinstance(v.type, ir.IntType):
                 w: int = v.type.width
-                builder.call(printf_function,
-                             (get_string(builder, "{} ({}): ".format(nid, w)),))
+                builder.call(printf_function, (get_string(builder, "{}; ".format(
+                    node_map[nid])),))
                 print_integer(builder, v, w, printf_function)
                 print_newline(builder, printf_function)
 
+        if name == 'bad':
+            builder.call(printf_function, (get_string(builder, '{}; ret: '.format(
+                bad_line.ljust(25))),))
+        elif name == 'constraint':
+            builder.call(printf_function, (get_string(builder, '{}; ret: '.format(
+                constraint_line.ljust(25))),))
+        print_integer(builder, ret, 1, printf_function)
+        print_newline(builder, printf_function)
         builder.ret(ret)
         return function
     else:
@@ -1007,7 +1050,7 @@ def build_print_state_function(module: ir.Module, bitvec_states: Iterable[Bitvec
     for i, bitvec_state in enumerate(bitvec_states):
         w: int = bitvec_state.sort.width
         builder.call(printf_function,
-                     (get_string(builder, "{} ({}): ".format(bitvec_state.nid, w)),))
+                     (get_string(builder, "{}; ".format(node_map[bitvec_state.nid])),))
         print_integer(builder,
                       builder.load(builder.gep(function.args[0], (ir.Constant(ir.IntType(32), 0),
                                                                   ir.Constant(ir.IntType(32), i)))),
@@ -1029,7 +1072,7 @@ def build_print_input_function(module: ir.Module, bitvec_inputs: Iterable[Bitvec
     for i, bitvec_input in enumerate(bitvec_inputs):
         w: int = bitvec_input.sort.width
         builder.call(printf_function,
-                     (get_string(builder, "{} ({}): ".format(bitvec_input.nid, w)),))
+                     (get_string(builder, "{}; ".format(node_map[bitvec_input.nid])),))
         print_integer(builder,
                       builder.load(builder.gep(function.args[0], (ir.Constant(ir.IntType(32), 0),
                                                                   ir.Constant(ir.IntType(32), i)))),
@@ -1126,7 +1169,6 @@ def build_test_function(module: ir.Module, state_struct_type: ir.BaseStructType,
     err_block: ir.Block = function.append_basic_block('error')
 
     entry_builder: ir.IRBuilder = ir.IRBuilder(entry_block)
-    entry_builder.call(printf_function, (get_string(entry_builder, '\nBegin\n'),))
     entry_builder.cbranch(
         entry_builder.icmp_unsigned('<', size, ir.Constant(ir.IntType(64), init_tu)),
         ret_block, init_block)
@@ -1136,8 +1178,8 @@ def build_test_function(module: ir.Module, state_struct_type: ir.BaseStructType,
     input_ptr: ir.AllocaInstr = init_builder.alloca(input_struct_type)
     init_builder.call(init_function, (state_ptr, input_ptr, data, ir_const_int(0, 64)))
 
-    state_s: ir.Value = get_string(init_builder, "State %d\n")
-    input_s: ir.Value = get_string(init_builder, "Input %d\n")
+    state_s: ir.Value = get_string(init_builder, "; State %d\n")
+    input_s: ir.Value = get_string(init_builder, "; Input %d\n")
     init_builder.call(printf_function, (state_s, ir.Constant(ir.IntType(32), 0)))
     init_builder.call(print_state_function, (state_ptr,))
     init_builder.call(printf_function, (input_s, ir.Constant(ir.IntType(32), 0)))
@@ -1245,6 +1287,10 @@ class Btor2Parser:
         return self.array_table[int(n)]
 
     def parse(self, source: TextIO) -> None:
+        global node_map, init_map, next_map, bad_line, constraint_line
+        node_map = {}
+        init_map = {}
+        next_map = {}
         for line in source:
             line_left: str
             _: str
@@ -1266,11 +1312,16 @@ class Btor2Parser:
 
             nid: int = int(tokens[0])
 
+            node_map[nid] = ' '.join(tokens) if tokens[-1].isnumeric() else ' '.join(tokens[:-1])
+            node_map[nid] = node_map[nid].ljust(25)
+
             if name == 'bad':
                 self.bad_list.append(Bad(nid, self.get_bitvec(tokens[2])))
+                bad_line = node_map[nid]
                 continue
             if name == 'constraint':
                 self.constraint_list.append(Constraint(nid, self.get_bitvec(tokens[2])))
+                constraint_line = node_map[nid]
                 continue
             if name == 'fair':
                 self.fair_list.append(Fair(nid, self.get_expr(tokens[2])))
@@ -1318,15 +1369,19 @@ class Btor2Parser:
                 init_sid: int = int(tokens[2])
                 if init_sid in self.bitvec_sort_table:
                     self.get_bitvec_state(tokens[3]).init = self.get_bitvec(tokens[4])
+                    init_map[self.get_bitvec_state(tokens[3]).nid] = node_map[nid]
                 elif init_sid in self.array_sort_table:
                     self.get_array_state(tokens[3]).init = self.get_expr(tokens[4])
+                    init_map[self.get_array_state(tokens[3]).nid] = node_map[nid]
                 continue
             if name == 'next':
                 next_sid: int = int(tokens[2])
                 if next_sid in self.bitvec_sort_table:
                     self.get_bitvec_state(tokens[3]).next = self.get_bitvec(tokens[4])
+                    next_map[self.get_bitvec_state(tokens[3]).nid] = node_map[nid]
                 elif next_sid in self.array_sort_table:
                     self.get_array_state(tokens[3]).next = self.get_array(tokens[4])
+                    next_map[self.get_array_state(tokens[3]).nid] = node_map[nid]
                 continue
             if name == 'write':
                 self.array_table[nid] = Write(nid, self.get_array_sort(int(tokens[2])),
@@ -1578,9 +1633,9 @@ class Btor2Parser:
         module.data_layout = data_layout
 
         global global_strings
-        global_strings = dict()
+        global_strings = {}
         global string_local_envs
-        string_local_envs = dict()
+        string_local_envs = {}
 
         def make_generator(builder: ir.IRBuilder) -> InputGenerator:
             return FuzzerInputGenerator(builder, builder.function.args[2], builder.function.args[3])
